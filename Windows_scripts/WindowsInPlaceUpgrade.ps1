@@ -44,6 +44,8 @@ if ($isServer) {
     foreach ($serverVersion in $serverUpgradeMatrix.Keys) {
         if ($windowsProductName -like "$serverVersion*") {
             $messages += "The VM is running $serverVersion. The supported upgrade options are: $($serverUpgradeMatrix[$serverVersion])."
+            $messages += ""
+            $messages += "Please refer to the official documentation for more details: https://learn.microsoft.com/en-us/azure/virtual-machines/windows-in-place-upgrade"
             break
         }
     }
