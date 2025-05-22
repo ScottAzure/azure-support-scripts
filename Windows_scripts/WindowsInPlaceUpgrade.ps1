@@ -1,4 +1,6 @@
 # Windows In-Place Upgrade Assessment Script
+# Author: Bowen Zhang
+# Last Updated: 2025-05-16
 # Description: Checks Windows version, server upgrade paths, and Azure VM security features for upgrade readiness.
 
 # --- OS Version Detection ---
@@ -55,7 +57,6 @@ if ($isServer) {
     if ($windowsMajorVersion -eq 10) {
         $biosVersion = (Get-WmiObject -Class Win32_BIOS).SMBIOSBIOSVersion
         if ($biosVersion -match 'UEFI') {
-            $messages += "The VM is running Windows 10 Gen2. you may upgrade it to Windows 11 via feature update, or using Windows 11 Installation Assistant. Confirm the upgrade eligibility using the PC Health Check App."
             try {
                 # Query Azure VM Metadata (single call for all checks)
                 $computeMetadata = Invoke-RestMethod -Uri "http://169.254.169.254/metadata/instance/compute?api-version=2023-07-01" -Headers @{Metadata='true'} -Method Get -UseBasicParsing
@@ -75,10 +76,14 @@ if ($isServer) {
                 if (-not $vtpmEnabledBool) { $notEnabled += 'Virtual TPM' }
                 if ($notEnabled.Count -gt 0) {
                     $messages += ""
-                    $messages += ("{0} is not enabled." -f ($notEnabled -join ', '))
+                    $messages += ("FAILED: {0} is not enabled." -f ($notEnabled -join ', '))
+                    $messages += ""
+                    $messages += "The VM is running Windows 10 Gen2. you may upgrade it to Windows 11 via feature update, or using Windows 11 Installation Assistant. Confirm the upgrade eligibility using the PC Health Check App."
                 } elseif ($trustedLaunchEnabled -and $secureBootEnabledBool -and $vtpmEnabledBool) {
                     $messages += ""
-                    $messages += 'The VM has Trusted Launch, Secure Boot and Virtual TPM enabled. OK'
+                    $messages += 'PASSED: The VM has Trusted Launch, Secure Boot and Virtual TPM enabled.'
+                    $messages += ""
+                    $messages += "The VM is running Windows 10 Gen2. you may upgrade it to Windows 11 via feature update, or using Windows 11 Installation Assistant. Confirm the upgrade eligibility using the PC Health Check App."
                 }
             } catch {
                 $messages += 'Error retrieving Azure metadata. Ensure the script is running on an Azure VM with access to instance metadata.'
@@ -87,7 +92,7 @@ if ($isServer) {
             $messages += 'PC Health Check App: https://support.microsoft.com/en-us/windows/how-to-use-the-pc-health-check-app-9c8abd9b-03ba-4e67-81ef-36f37caa7844'
             $messages += 'Windows 11 Installation Assistant: https://www.microsoft.com/en-us/software-download/windows11'
         } else {
-            $messages += 'The VM is running Windows 10 Gen1. Upgrade to Windows 11 is only supported for Gen2 VMs'
+            $messages += 'FAILED: The VM is running Windows 10 Gen1. Upgrade to Windows 11 is only supported for Gen2 VMs'
         }
     }
     # --- Windows 11 Upgrade Readiness ---
@@ -100,9 +105,9 @@ if ($isServer) {
                 $securityType = $computeMetadata.securityProfile.securityType
                 $trustedLaunchEnabled = $securityType -eq 'TrustedLaunch'
                 if ($trustedLaunchEnabled) {
-                    $messages += 'The Windows is eligible for upgrading to Windows 11 22H2 and above.'
+                    $messages += 'PASSED: The Windows is eligible for upgrading to Windows 11 22H2 and above.'
                 } else {
-                    $messages += 'Upgrading Windows 11 to 22H2 and above requires Trusted Launch to be enabled.'
+                    $messages += 'FAILED: Upgrading Windows 11 to 22H2 and above requires Trusted Launch to be enabled.'
                 }
             } catch {
                 $messages += 'Error retrieving Azure metadata. Ensure the script is running on an Azure VM with access to instance metadata.'
