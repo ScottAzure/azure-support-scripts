@@ -408,11 +408,11 @@ foreach ($chk in $certsToCheck) {
             Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
             $expiredCerts += $chk
         } elseif ($daysLeft -lt $warningDays) {
-            Write-Host "  [WARN] $($chk.CN) — expires in $daysLeft days ($($found.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Yellow
+            Write-Host "  [WARN] $($chk.CN) — expires in $daysLeft days - $($found.NotAfter.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
             Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
             $expiringCerts += $chk
         } else {
-            Write-Host "  [OK]   $($chk.CN) — valid until $($found.NotAfter.ToString('yyyy-MM-dd')) ($daysLeft days)" -ForegroundColor Green
+            Write-Host "  [OK]   $($chk.CN) — valid until $($found.NotAfter.ToString('yyyy-MM-dd')) - $daysLeft days remaining" -ForegroundColor Green
         }
     }
 }
