@@ -404,15 +404,15 @@ foreach ($chk in $certsToCheck) {
     if ($found) {
         $daysLeft = ($found.NotAfter - $now).Days
         if ($daysLeft -lt 0) {
-            Write-Host "  [FAIL] $($chk.CN) — EXPIRED ($($found.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Red
+            Write-Host "  [FAIL] $($chk.CN) - EXPIRED ($($found.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Red
             Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
             $expiredCerts += $chk
         } elseif ($daysLeft -lt $warningDays) {
-            Write-Host "  [WARN] $($chk.CN) — expires in $daysLeft days - $($found.NotAfter.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
+            Write-Host "  [WARN] $($chk.CN) - expires in $daysLeft days - $($found.NotAfter.ToString('yyyy-MM-dd'))" -ForegroundColor Yellow
             Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
             $expiringCerts += $chk
         } else {
-            Write-Host "  [OK]   $($chk.CN) — valid until $($found.NotAfter.ToString('yyyy-MM-dd')) - $daysLeft days remaining" -ForegroundColor Green
+            Write-Host "  [OK]   $($chk.CN) - valid until $($found.NotAfter.ToString('yyyy-MM-dd')) - $daysLeft days remaining" -ForegroundColor Green
         }
     }
 }
@@ -432,7 +432,7 @@ $currentProtocol = [Net.ServicePointManager]::SecurityProtocol
 Write-Host "  Current SecurityProtocol: $currentProtocol"
 
 if ($currentProtocol -notmatch 'Tls12') {
-    Write-Host "  [WARN] TLS 1.2 not in SecurityProtocol — HTTPS cert downloads may fail" -ForegroundColor Yellow
+    Write-Host "  [WARN] TLS 1.2 not in SecurityProtocol - HTTPS cert downloads may fail" -ForegroundColor Yellow
     $tls12Issue = $true
 }
 
@@ -452,12 +452,12 @@ if (Test-Path $regPath) {
     # No explicit registry setting = OS default (usually enabled on 2016+)
     $osVersion = [System.Environment]::OSVersion.Version
     if ($osVersion.Major -eq 6 -and $osVersion.Minor -le 3) {
-        # Windows Server 2012 R2 or older — TLS 1.2 may not be default
+        # Windows Server 2012 R2 or older - TLS 1.2 may not be default
         Write-Host "  [WARN] No explicit TLS 1.2 registry setting on $([System.Environment]::OSVersion.VersionString)" -ForegroundColor Yellow
         Write-Host "         Older OS versions may not have TLS 1.2 enabled by default." -ForegroundColor Yellow
         $tls12Issue = $true
     } else {
-        Write-Host "  [PASS] TLS 1.2 (OS default — no explicit override)" -ForegroundColor Green
+        Write-Host "  [PASS] TLS 1.2 (OS default - no explicit override)" -ForegroundColor Green
     }
 }
 
@@ -481,7 +481,7 @@ try {
     Write-Host "  [WARN] Could not check proxy: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
-# CryptoAPI cache check — look for OCSP certs in CurrentUser\CA that differ from chain
+# CryptoAPI cache check - look for OCSP certs in CurrentUser\CA that differ from chain
 if ($chain.ChainElements.Count -gt 1) {
     $cuStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("CA", "CurrentUser")
     $cuStore.Open("ReadOnly")
@@ -601,7 +601,7 @@ if ($AutoFix) {
             $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $mc.Thumbprint }
             $disStore.Close()
             if ($inDisallowed) {
-                Write-Host "`n  [SKIP] $($mc.CN) — in Disallowed store (policy decision, cannot auto-fix)" -ForegroundColor Yellow
+                Write-Host "`n  [SKIP] $($mc.CN) - in Disallowed store (policy decision, cannot auto-fix)" -ForegroundColor Yellow
                 $failedCount++
                 continue
             }
@@ -658,3 +658,4 @@ if ($AutoFix) {
     Write-Host "`n  [INFO] AutoFix: No issues to fix." -ForegroundColor Green
 }
 Write-Host "Script completed.`n" -ForegroundColor Cyan
+

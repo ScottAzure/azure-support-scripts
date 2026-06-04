@@ -249,13 +249,13 @@ check_cert_expiry() {
                 local remaining=$((end_epoch - NOW_EPOCH))
                 local days_left=$((remaining / 86400))
                 if [ "$remaining" -lt 0 ]; then
-                    echo "  [FAIL] $label — EXPIRED ($enddate)"
+                    echo "  [FAIL] $label - EXPIRED ($enddate)"
                     EXPIRED_CERTS=$((EXPIRED_CERTS + 1))
                 elif [ "$remaining" -lt "$WARN_SECS" ]; then
-                    echo "  [WARN] $label — expires in $days_left days ($enddate)"
+                    echo "  [WARN] $label - expires in $days_left days ($enddate)"
                     EXPIRING_CERTS=$((EXPIRING_CERTS + 1))
                 else
-                    echo "  [OK]   $label — valid until $enddate ($days_left days)"
+                    echo "  [OK]   $label - valid until $enddate ($days_left days)"
                 fi
             fi
         fi
@@ -509,3 +509,4 @@ elif [ "$AUTOFIX" = true ] && [ "$CHAIN_OK" = true ]; then
 fi
 
 echo "Script completed."
+
