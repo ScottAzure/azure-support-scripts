@@ -34,7 +34,19 @@ Disclaimer:
 .EXAMPLE
     Run as administrator:
     PS> .\Windows_IMDSValidation.ps1
+
+.EXAMPLE
+    Run with auto-fix (downloads and installs missing certificates, then re-validates):
+    PS> .\Windows_IMDSValidation.ps1 -AutoFix
+
+.PARAMETER AutoFix
+    When specified, the script attempts to download and install missing intermediate
+    certificates, then re-validates the chain. Default is diagnostic-only (no changes).
 #>
+
+param(
+    [switch]$AutoFix = $false
+)
 
 # ---- Display banner ----------------------------------------------------------
 Write-Host "=====================================================" -ForegroundColor Cyan
@@ -391,4 +403,78 @@ if ($chainBuilt -and $chainErrors.Count -eq 0 -and $missingCerts.Count -eq 0 -an
 
 Write-Host "`nChain: DigiCert Global Root G2 > Microsoft TLS RSA Root G2 (cross-sign) > OCSP Intermediate > Leaf" -ForegroundColor Cyan
 Write-Host "Additional Information: https://aka.ms/AzVmIMDSValidation" -ForegroundColor Cyan
+# ---- AutoFix Phase: Download, Install, Re-validate --------------------------
+if ($AutoFix -and $missingCerts.Count -gt 0) {
+    Write-Host "`n=============================================" -ForegroundColor Magenta
+    Write-Host " AutoFix: Attempting certificate remediation" -ForegroundColor Magenta
+    Write-Host "=============================================" -ForegroundColor Magenta
+
+    $fixedCount = 0
+    $failedCount = 0
+
+    foreach ($mc in $missingCerts) {
+        # Skip certs in the Disallowed store — can't auto-fix policy decisions
+        $disStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Disallowed", $mc.Location)
+        $disStore.Open("ReadOnly")
+        $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $mc.Thumbprint }
+        $disStore.Close()
+        if ($inDisallowed) {
+            Write-Host "`n  [SKIP] $($mc.CN) — in Disallowed store (policy decision, cannot auto-fix)" -ForegroundColor Yellow
+            $failedCount++
+            continue
+        }
+
+        Write-Host "`n  Downloading: $($mc.CN)" -ForegroundColor Cyan
+        Write-Host "    URL: $($mc.DownloadUrl)"
+        try {
+            $tmpPath = "$env:TEMP\imds_cert_$($mc.Thumbprint).crt"
+            Invoke-WebRequest -Uri $mc.DownloadUrl -OutFile $tmpPath -UseBasicParsing -TimeoutSec 15
+            Write-Host "    [OK] Downloaded" -ForegroundColor Green
+
+            # Install to the correct store
+            $targetStore = New-Object System.Security.Cryptography.X509Certificates.X509Store($mc.Store, $mc.Location)
+            $targetStore.Open("ReadWrite")
+            $newCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($tmpPath)
+            $targetStore.Add($newCert)
+            $targetStore.Close()
+
+            Write-Host "    [OK] Installed to $($mc.Location)\$($mc.Store)" -ForegroundColor Green
+            $fixedCount++
+
+            # Clean up temp file
+            Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Host "    [FAIL] $($_.Exception.Message)" -ForegroundColor Red
+            $failedCount++
+        }
+    }
+
+    # Re-validate the chain
+    Write-Host "`n  Re-validating certificate chain..." -ForegroundColor Cyan
+    $chain2 = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    $chain2.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::Online
+    $chain2Built = $chain2.Build($cert)
+
+    if ($chain2Built) {
+        Write-Host "  [PASS] Certificate chain now validates successfully!" -ForegroundColor Green
+    } else {
+        Write-Host "  [FAIL] Certificate chain still fails after remediation." -ForegroundColor Red
+        Write-Host "         Review Phase 3 output above for remaining issues." -ForegroundColor Yellow
+    }
+
+    # Run fclip.exe if chain now passes
+    if ($chain2Built -and (Test-Path "$env:SystemRoot\System32\fclip.exe")) {
+        Write-Host "`n  Running fclip.exe to clear activation watermark..." -ForegroundColor Cyan
+        try {
+            & "$env:SystemRoot\System32\fclip.exe" 2>$null
+            Write-Host "  [OK] fclip.exe completed. Sign out and sign back in to clear the watermark." -ForegroundColor Green
+        } catch {
+            Write-Host "  [WARN] fclip.exe failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "`n  AutoFix Summary: $fixedCount installed, $failedCount failed/skipped" -ForegroundColor Cyan
+} elseif ($AutoFix -and $missingCerts.Count -eq 0) {
+    Write-Host "`n  [INFO] AutoFix: No missing certificates to fix." -ForegroundColor Green
+}
 Write-Host "Script completed.`n" -ForegroundColor Cyan

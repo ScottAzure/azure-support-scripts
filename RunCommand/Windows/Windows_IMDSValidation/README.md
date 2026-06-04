@@ -34,6 +34,7 @@ DigiCert Global Root G2 (DF3C24F9...)
 - **Store inventory** — Checks correct store placement and warns about certs in wrong stores or the Disallowed store
 - **AIA/CRL/OCSP connectivity** — Tests all endpoints needed for certificate download and validation
 - **Actionable output** — Specific download URLs and fix steps, not just generic "go to this page"
+- **AutoFix mode** — Optional `-AutoFix` switch downloads and installs missing certificates, re-validates, and clears the activation watermark
 
 ## Prerequisites
 
@@ -50,6 +51,12 @@ Set-ExecutionPolicy Bypass -Force
 .\Windows_IMDSValidation.ps1
 ```
 
+With auto-fix (downloads missing certs, installs, re-validates, runs fclip.exe):
+
+```powershell
+.\Windows_IMDSValidation.ps1 -AutoFix
+```
+
 Or via Azure Run Command:
 - Azure Portal → VM → Operations → Run Command → Select `Windows_IMDSValidation`
 
@@ -58,7 +65,7 @@ Or via Azure Run Command:
 | Phase 4 Output | Meaning | Action |
 |---|---|---|
 | `[OK]` | Certificate found in correct store | None needed |
-| `[MISS]` | Certificate not found | Download and install from the URL shown |
+| `[MISS]` | Certificate not found | Download and install from the URL shown, or use `-AutoFix` |
 | `[WARN] Found in WRONG store` | Cert exists but in incorrect store | Move to the correct store |
 | `[WARN] DISALLOWED store` | Cert is explicitly blocked | Remove from Disallowed store |
 

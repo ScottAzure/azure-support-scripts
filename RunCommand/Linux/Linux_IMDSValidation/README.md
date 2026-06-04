@@ -58,10 +58,25 @@ az vm run-command invoke \
     --scripts @Linux_IMDSValidation.sh
 ```
 
+With auto-fix (downloads missing certs, installs, updates trust store, re-validates):
+
+```bash
+az vm run-command invoke \\
+    --resource-group <resource-group> \\
+    --name <vm-name> \\
+    --command-id RunShellScript \\
+    --scripts @Linux_IMDSValidation.sh \\
+    --parameters "--autofix"
+```
+
 ### Download and run locally
 
 ```bash
+# Diagnostic only (default)
 curl -sL https://raw.githubusercontent.com/Azure/azure-support-scripts/master/RunCommand/Linux/Linux_IMDSValidation/Linux_IMDSValidation.sh | sudo bash
+
+# With auto-fix
+curl -sL https://raw.githubusercontent.com/Azure/azure-support-scripts/master/RunCommand/Linux/Linux_IMDSValidation/Linux_IMDSValidation.sh | sudo bash -s -- --autofix
 ```
 
 ### Run from within the VM

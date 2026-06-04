@@ -25,6 +25,15 @@
 #   Requires openssl and python3.
 #   Tested on Ubuntu 22.04, RHEL 9, SUSE 15.
 #   Reference: https://aka.ms/AzVmIMDSValidation
+#
+# Usage:
+#   ./Linux_IMDSValidation.sh              # Diagnostic only (default)
+#   ./Linux_IMDSValidation.sh --autofix    # Download, install, re-validate
+
+AUTOFIX=false
+if [ "${1:-}" = "--autofix" ]; then
+    AUTOFIX=true
+fi
 
 set -euo pipefail
 
@@ -266,4 +275,109 @@ fi
 echo ""
 echo "Chain: DigiCert Global Root G2 > Microsoft TLS RSA Root G2 (cross-sign) > OCSP Intermediate > Leaf"
 echo "Additional Information: https://aka.ms/AzVmIMDSValidation"
+
+# ---- AutoFix Phase ----
+if [ "$AUTOFIX" = true ] && [ "$CHAIN_OK" = false ]; then
+    echo ""
+    echo "============================================="
+    echo " AutoFix: Attempting certificate remediation"
+    echo "============================================="
+
+    # Detect distro for cert install path
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+    fi
+
+    FIXED=0
+    FAILED=0
+
+    install_cert() {
+        local url="$1"
+        local name="$2"
+        local tmpfile="/tmp/imds_autofix_${name}.der"
+
+        echo ""
+        echo "  Downloading: $name"
+        echo "    URL: $url"
+        if ! curl -s --connect-timeout 10 -o "$tmpfile" "$url"; then
+            echo "    [FAIL] Download failed (AIA may be blocked)" 
+            FAILED=$((FAILED + 1))
+            return 1
+        fi
+        echo "    [OK] Downloaded"
+
+        # Convert DER to PEM
+        local pemfile="/tmp/imds_autofix_${name}.pem"
+        if ! openssl x509 -in "$tmpfile" -inform DER -out "$pemfile" 2>/dev/null; then
+            echo "    [FAIL] DER to PEM conversion failed"
+            FAILED=$((FAILED + 1))
+            return 1
+        fi
+
+        # Install based on distro
+        case "${ID:-unknown}" in
+            ubuntu|debian)
+                cp "$pemfile" "/usr/local/share/ca-certificates/${name}.crt"
+                ;;
+            rhel|centos|ol|almalinux|rocky|mariner|azurelinux)
+                cp "$pemfile" "/etc/pki/ca-trust/source/anchors/${name}.crt"
+                ;;
+            sles|opensuse*)
+                cp "$pemfile" "/usr/share/pki/trust/anchors/${name}.crt"
+                ;;
+            *)
+                echo "    [FAIL] Unknown distro: ${ID:-unknown}"
+                FAILED=$((FAILED + 1))
+                return 1
+                ;;
+        esac
+        echo "    [OK] Installed to trust store"
+        FIXED=$((FIXED + 1))
+
+        rm -f "$tmpfile" "$pemfile" 2>/dev/null
+        return 0
+    }
+
+    # Install cross-signed intermediate (B5EE)
+    install_cert "http://caissuers.microsoft.com/pkiops/certs/Microsoft%20TLS%20RSA%20Root%20G2%20-%20xsign.crt" "microsoft-tls-rsa-root-g2"
+
+    # Install OCSP intermediate
+    if [ "$OCSP_NUM" != "unknown" ]; then
+        install_cert "https://www.microsoft.com/pkiops/certs/Microsoft%20TLS%20G2%20RSA%20CA%20OCSP%20${OCSP_NUM}.crt" "microsoft-tls-g2-rsa-ca-ocsp-${OCSP_NUM}"
+    fi
+
+    # Update trust store
+    echo ""
+    echo "  Updating trust store..."
+    case "${ID:-unknown}" in
+        ubuntu|debian)
+            update-ca-certificates 2>/dev/null
+            ;;
+        rhel|centos|ol|almalinux|rocky|mariner|azurelinux)
+            update-ca-trust 2>/dev/null
+            ;;
+        sles|opensuse*)
+            update-ca-certificates 2>/dev/null
+            ;;
+    esac
+    echo "  [OK] Trust store updated"
+
+    # Re-validate
+    echo ""
+    echo "  Re-validating certificate chain..."
+    VERIFY2=$(openssl verify /tmp/imds_cert.pem 2>&1)
+    if echo "$VERIFY2" | grep -q ": OK"; then
+        echo "  [PASS] Certificate chain now validates successfully!"
+    else
+        echo "  [FAIL] Chain still fails after remediation."
+        echo "  $VERIFY2"
+    fi
+
+    echo ""
+    echo "  AutoFix Summary: $FIXED installed, $FAILED failed"
+elif [ "$AUTOFIX" = true ] && [ "$CHAIN_OK" = true ]; then
+    echo ""
+    echo "  [INFO] AutoFix: Chain already validates. No action needed."
+fi
+
 echo "Script completed."
