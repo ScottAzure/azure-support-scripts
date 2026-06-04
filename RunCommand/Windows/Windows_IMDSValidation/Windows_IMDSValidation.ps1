@@ -361,12 +361,156 @@ foreach ($category in $tcpTargets.Keys) {
     }
 }
 
-# ---- Phase 6: Summary & Recommendations -------------------------------------
+# ---- Phase 6: Clock Skew Detection ------------------------------------------
+Write-Host "`n[Phase 6] System Clock Validation" -ForegroundColor Cyan
+Write-Host "---------------------------------" -ForegroundColor Cyan
+$clockSkewDetected = $false
+try {
+    $w32tmOutput = w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 2>&1
+    $offsetLine = $w32tmOutput | Where-Object { $_ -match '[+-]\d+\.\d+s' } | Select-Object -Last 1
+    if ($offsetLine -match '([+-]?\d+\.\d+)s') {
+        $offsetSeconds = [math]::Abs([double]$Matches[1])
+        if ($offsetSeconds -gt 300) {
+            Write-Host "  [FAIL] Clock offset: $([math]::Round($offsetSeconds))s from time.windows.com" -ForegroundColor Red
+            Write-Host "         Certs may appear expired or not-yet-valid due to clock skew." -ForegroundColor Yellow
+            Write-Host "         Fix: w32tm /resync /force" -ForegroundColor Yellow
+            $clockSkewDetected = $true
+        } elseif ($offsetSeconds -gt 60) {
+            Write-Host "  [WARN] Clock offset: $([math]::Round($offsetSeconds))s from time.windows.com" -ForegroundColor Yellow
+        } else {
+            Write-Host "  [PASS] Clock offset: $([math]::Round($offsetSeconds))s (within tolerance)" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  [WARN] Could not parse w32tm output" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  [WARN] Clock check failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# ---- Phase 7: Certificate Expiry Check --------------------------------------
+Write-Host "`n[Phase 7] Certificate Expiry Check" -ForegroundColor Cyan
+Write-Host "----------------------------------" -ForegroundColor Cyan
+$expiringCerts = @()
+$expiredCerts = @()
+$now = [DateTime]::UtcNow
+$warningDays = 60
+
+foreach ($chk in $certsToCheck) {
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($chk.Store, $chk.Location)
+    $store.Open("ReadOnly")
+    $found = $store.Certificates | Where-Object { $_.Thumbprint -eq $chk.Thumbprint }
+    $store.Close()
+
+    if ($found) {
+        $daysLeft = ($found.NotAfter - $now).Days
+        if ($daysLeft -lt 0) {
+            Write-Host "  [FAIL] $($chk.CN) — EXPIRED ($($found.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Red
+            Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
+            $expiredCerts += $chk
+        } elseif ($daysLeft -lt $warningDays) {
+            Write-Host "  [WARN] $($chk.CN) — expires in $daysLeft days ($($found.NotAfter.ToString('yyyy-MM-dd')))" -ForegroundColor Yellow
+            Write-Host "         Download fresh: $($chk.DownloadUrl)" -ForegroundColor Yellow
+            $expiringCerts += $chk
+        } else {
+            Write-Host "  [OK]   $($chk.CN) — valid until $($found.NotAfter.ToString('yyyy-MM-dd')) ($daysLeft days)" -ForegroundColor Green
+        }
+    }
+}
+
+if ($unreachableCount -gt 0 -and ($expiringCerts.Count -gt 0 -or $expiredCerts.Count -gt 0)) {
+    Write-Host "`n  [ALERT] AIA is blocked AND certificates are expiring/expired." -ForegroundColor Red
+    Write-Host "          This VM cannot auto-download replacements." -ForegroundColor Red
+    Write-Host "          Manually download from the URLs above." -ForegroundColor Yellow
+}
+
+# ---- Phase 8: TLS 1.2 Check (Windows-specific) ------------------------------
+Write-Host "`n[Phase 8] TLS 1.2 Configuration" -ForegroundColor Cyan
+Write-Host "-------------------------------" -ForegroundColor Cyan
+$tls12Issue = $false
+
+$currentProtocol = [Net.ServicePointManager]::SecurityProtocol
+Write-Host "  Current SecurityProtocol: $currentProtocol"
+
+if ($currentProtocol -notmatch 'Tls12') {
+    Write-Host "  [WARN] TLS 1.2 not in SecurityProtocol — HTTPS cert downloads may fail" -ForegroundColor Yellow
+    $tls12Issue = $true
+}
+
+$regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client'
+if (Test-Path $regPath) {
+    $enabled = (Get-ItemProperty -Path $regPath -Name 'Enabled' -ErrorAction SilentlyContinue).Enabled
+    $disabled = (Get-ItemProperty -Path $regPath -Name 'DisabledByDefault' -ErrorAction SilentlyContinue).DisabledByDefault
+    if ($enabled -eq 0 -or $disabled -eq 1) {
+        Write-Host "  [FAIL] TLS 1.2 is disabled in SCHANNEL registry" -ForegroundColor Red
+        Write-Host "         HTTPS cert downloads (OCSP intermediates) will fail." -ForegroundColor Yellow
+        Write-Host "         Fix: Enable TLS 1.2 in registry and restart." -ForegroundColor Yellow
+        $tls12Issue = $true
+    } else {
+        Write-Host "  [PASS] TLS 1.2 enabled in SCHANNEL registry" -ForegroundColor Green
+    }
+} else {
+    # No explicit registry setting = OS default (usually enabled on 2016+)
+    $osVersion = [System.Environment]::OSVersion.Version
+    if ($osVersion.Major -eq 6 -and $osVersion.Minor -le 3) {
+        # Windows Server 2012 R2 or older — TLS 1.2 may not be default
+        Write-Host "  [WARN] No explicit TLS 1.2 registry setting on $([System.Environment]::OSVersion.VersionString)" -ForegroundColor Yellow
+        Write-Host "         Older OS versions may not have TLS 1.2 enabled by default." -ForegroundColor Yellow
+        $tls12Issue = $true
+    } else {
+        Write-Host "  [PASS] TLS 1.2 (OS default — no explicit override)" -ForegroundColor Green
+    }
+}
+
+# ---- Phase 9: Proxy & CryptoAPI Cache Check ----------------------------------
+Write-Host "`n[Phase 9] Proxy & Cache Check" -ForegroundColor Cyan
+Write-Host "-----------------------------" -ForegroundColor Cyan
+
+# Proxy detection
+$proxyDetected = $false
+try {
+    $proxyOutput = netsh winhttp show proxy 2>&1
+    if ($proxyOutput -match 'Proxy Server') {
+        $proxyLine = ($proxyOutput | Where-Object { $_ -match 'Proxy Server' }) -join ''
+        Write-Host "  [INFO] WinHTTP proxy configured: $($proxyLine.Trim())" -ForegroundColor Yellow
+        Write-Host "         If AIA endpoints are blocked, add them to bypass list." -ForegroundColor Yellow
+        $proxyDetected = $true
+    } else {
+        Write-Host "  [OK]   No WinHTTP proxy configured" -ForegroundColor Green
+    }
+} catch {
+    Write-Host "  [WARN] Could not check proxy: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# CryptoAPI cache check — look for OCSP certs in CurrentUser\CA that differ from chain
+if ($chain.ChainElements.Count -gt 1) {
+    $cuStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("CA", "CurrentUser")
+    $cuStore.Open("ReadOnly")
+    $staleCerts = @()
+    foreach ($el in $chain.ChainElements) {
+        $chainCert = $el.Certificate
+        if ($chainCert.Subject -match "OCSP") {
+            $cachedOCSP = $cuStore.Certificates | Where-Object {
+                $_.Subject -match "OCSP" -and $_.Thumbprint -ne $chainCert.Thumbprint
+            }
+            foreach ($stale in $cachedOCSP) {
+                $staleCerts += $stale
+                Write-Host "  [WARN] Stale OCSP in CurrentUser\CA: $($stale.Subject)" -ForegroundColor Yellow
+                Write-Host "         Thumbprint: $($stale.Thumbprint) (chain uses $($chainCert.Thumbprint))" -ForegroundColor Yellow
+            }
+        }
+    }
+    $cuStore.Close()
+    if ($staleCerts.Count -eq 0) {
+        Write-Host "  [OK]   No stale OCSP certs in CryptoAPI cache" -ForegroundColor Green
+    }
+}
+
+# ---- Phase 10: Summary & Recommendations ------------------------------------
 Write-Host "`n=====================================================" -ForegroundColor Cyan
 Write-Host "[Summary]" -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 
-if ($chainBuilt -and $chainErrors.Count -eq 0 -and $missingCerts.Count -eq 0 -and $unreachableCount -eq 0) {
+if ($chainBuilt -and $chainErrors.Count -eq 0 -and $missingCerts.Count -eq 0 -and $unreachableCount -eq 0 -and -not $clockSkewDetected -and $expiredCerts.Count -eq 0 -and -not $tls12Issue) {
     Write-Host "  ALL CHECKS PASSED" -ForegroundColor Green
     Write-Host "  IMDS attestation certificate chain is healthy." -ForegroundColor Green
 } else {
@@ -404,48 +548,84 @@ if ($chainBuilt -and $chainErrors.Count -eq 0 -and $missingCerts.Count -eq 0 -an
 Write-Host "`nChain: DigiCert Global Root G2 > Microsoft TLS RSA Root G2 (cross-sign) > OCSP Intermediate > Leaf" -ForegroundColor Cyan
 Write-Host "Additional Information: https://aka.ms/AzVmIMDSValidation" -ForegroundColor Cyan
 # ---- AutoFix Phase: Download, Install, Re-validate --------------------------
-if ($AutoFix -and $missingCerts.Count -gt 0) {
+if ($AutoFix) {
     Write-Host "`n=============================================" -ForegroundColor Magenta
-    Write-Host " AutoFix: Attempting certificate remediation" -ForegroundColor Magenta
+    Write-Host " AutoFix: Attempting remediation" -ForegroundColor Magenta
     Write-Host "=============================================" -ForegroundColor Magenta
 
     $fixedCount = 0
     $failedCount = 0
 
-    foreach ($mc in $missingCerts) {
-        # Skip certs in the Disallowed store — can't auto-fix policy decisions
-        $disStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Disallowed", $mc.Location)
-        $disStore.Open("ReadOnly")
-        $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $mc.Thumbprint }
-        $disStore.Close()
-        if ($inDisallowed) {
-            Write-Host "`n  [SKIP] $($mc.CN) — in Disallowed store (policy decision, cannot auto-fix)" -ForegroundColor Yellow
-            $failedCount++
-            continue
-        }
-
-        Write-Host "`n  Downloading: $($mc.CN)" -ForegroundColor Cyan
-        Write-Host "    URL: $($mc.DownloadUrl)"
+    # Fix clock skew first (affects all cert validation)
+    if ($clockSkewDetected) {
+        Write-Host "`n  Fixing clock skew..." -ForegroundColor Cyan
         try {
-            $tmpPath = "$env:TEMP\imds_cert_$($mc.Thumbprint).crt"
-            Invoke-WebRequest -Uri $mc.DownloadUrl -OutFile $tmpPath -UseBasicParsing -TimeoutSec 15
-            Write-Host "    [OK] Downloaded" -ForegroundColor Green
-
-            # Install to the correct store
-            $targetStore = New-Object System.Security.Cryptography.X509Certificates.X509Store($mc.Store, $mc.Location)
-            $targetStore.Open("ReadWrite")
-            $newCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($tmpPath)
-            $targetStore.Add($newCert)
-            $targetStore.Close()
-
-            Write-Host "    [OK] Installed to $($mc.Location)\$($mc.Store)" -ForegroundColor Green
+            $resyncOutput = w32tm /resync /force 2>&1
+            Write-Host "  [OK] Clock resynced" -ForegroundColor Green
             $fixedCount++
-
-            # Clean up temp file
-            Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
         } catch {
-            Write-Host "    [FAIL] $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  [FAIL] Clock resync failed: $($_.Exception.Message)" -ForegroundColor Red
             $failedCount++
+        }
+    }
+
+    # Fix expired certs (re-download from AIA)
+    if ($expiredCerts.Count -gt 0) {
+        Write-Host "`n  Replacing $($expiredCerts.Count) expired certificate(s)..." -ForegroundColor Cyan
+        foreach ($ec in $expiredCerts) {
+            try {
+                $tmpPath = "$env:TEMP\imds_cert_expired_$($ec.Thumbprint).crt"
+                Invoke-WebRequest -Uri $ec.DownloadUrl -OutFile $tmpPath -UseBasicParsing -TimeoutSec 15
+                $targetStore = New-Object System.Security.Cryptography.X509Certificates.X509Store($ec.Store, $ec.Location)
+                $targetStore.Open("ReadWrite")
+                $newCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($tmpPath)
+                $targetStore.Add($newCert)
+                $targetStore.Close()
+                Write-Host "  [OK] Replaced expired $($ec.CN)" -ForegroundColor Green
+                $fixedCount++
+                Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Host "  [FAIL] $($ec.CN): $($_.Exception.Message)" -ForegroundColor Red
+                $failedCount++
+            }
+        }
+    }
+
+    # Fix missing certs
+    if ($missingCerts.Count -gt 0) {
+        Write-Host "`n  Installing $($missingCerts.Count) missing certificate(s)..." -ForegroundColor Cyan
+        foreach ($mc in $missingCerts) {
+            # Skip certs in the Disallowed store
+            $disStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Disallowed", $mc.Location)
+            $disStore.Open("ReadOnly")
+            $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $mc.Thumbprint }
+            $disStore.Close()
+            if ($inDisallowed) {
+                Write-Host "`n  [SKIP] $($mc.CN) — in Disallowed store (policy decision, cannot auto-fix)" -ForegroundColor Yellow
+                $failedCount++
+                continue
+            }
+
+            Write-Host "`n  Downloading: $($mc.CN)" -ForegroundColor Cyan
+            Write-Host "    URL: $($mc.DownloadUrl)"
+            try {
+                $tmpPath = "$env:TEMP\imds_cert_$($mc.Thumbprint).crt"
+                Invoke-WebRequest -Uri $mc.DownloadUrl -OutFile $tmpPath -UseBasicParsing -TimeoutSec 15
+                Write-Host "    [OK] Downloaded" -ForegroundColor Green
+
+                $targetStore = New-Object System.Security.Cryptography.X509Certificates.X509Store($mc.Store, $mc.Location)
+                $targetStore.Open("ReadWrite")
+                $newCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($tmpPath)
+                $targetStore.Add($newCert)
+                $targetStore.Close()
+
+                Write-Host "    [OK] Installed to $($mc.Location)\$($mc.Store)" -ForegroundColor Green
+                $fixedCount++
+                Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Host "    [FAIL] $($_.Exception.Message)" -ForegroundColor Red
+                $failedCount++
+            }
         }
     }
 
@@ -473,8 +653,8 @@ if ($AutoFix -and $missingCerts.Count -gt 0) {
         }
     }
 
-    Write-Host "`n  AutoFix Summary: $fixedCount installed, $failedCount failed/skipped" -ForegroundColor Cyan
-} elseif ($AutoFix -and $missingCerts.Count -eq 0) {
-    Write-Host "`n  [INFO] AutoFix: No missing certificates to fix." -ForegroundColor Green
+    Write-Host "`n  AutoFix Summary: $fixedCount fixed, $failedCount failed/skipped" -ForegroundColor Cyan
+} elseif ($AutoFix) {
+    Write-Host "`n  [INFO] AutoFix: No issues to fix." -ForegroundColor Green
 }
 Write-Host "Script completed.`n" -ForegroundColor Cyan

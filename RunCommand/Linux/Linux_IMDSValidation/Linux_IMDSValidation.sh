@@ -184,13 +184,128 @@ for label in "${!TARGETS[@]}"; do
     fi
 done
 
-# ---- Phase 7: Summary & Fix Commands ----
+# ---- Phase 7: Clock Skew Detection ----
+echo ""
+echo "[Phase 7] System Clock Validation"
+echo "----------------------------------"
+CLOCK_SKEW=false
+
+# Try chrony first, then ntpd, then manual date comparison
+if command -v chronyc &>/dev/null; then
+    OFFSET=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[0-9]+\.[0-9]+')
+    if [ -n "$OFFSET" ]; then
+        OFFSET_INT=$(echo "$OFFSET" | cut -d. -f1)
+        if [ "${OFFSET_INT:-0}" -gt 300 ]; then
+            echo "  [FAIL] Clock offset: ${OFFSET}s (chrony)"
+            echo "         Certs may appear expired or not-yet-valid."
+            echo "         Fix: sudo chronyc makestep"
+            CLOCK_SKEW=true
+        elif [ "${OFFSET_INT:-0}" -gt 60 ]; then
+            echo "  [WARN] Clock offset: ${OFFSET}s (chrony)"
+        else
+            echo "  [PASS] Clock offset: ${OFFSET}s (within tolerance)"
+        fi
+    else
+        echo "  [WARN] Could not parse chrony output"
+    fi
+elif command -v ntpq &>/dev/null; then
+    OFFSET=$(ntpq -p 2>/dev/null | tail -1 | awk '{print $9}')
+    if [ -n "$OFFSET" ]; then
+        OFFSET_ABS=${OFFSET#-}
+        if [ "${OFFSET_ABS%%.*}" -gt 300000 ] 2>/dev/null; then
+            echo "  [FAIL] Clock offset: ${OFFSET}ms (ntpd)"
+            echo "         Fix: sudo ntpdate time.windows.com"
+            CLOCK_SKEW=true
+        else
+            echo "  [PASS] Clock offset: ${OFFSET}ms (ntpd)"
+        fi
+    else
+        echo "  [WARN] Could not parse ntpq output"
+    fi
+else
+    echo "  [WARN] No NTP client found (chrony/ntpd). Cannot check clock accuracy."
+fi
+
+# ---- Phase 8: Certificate Expiry Check ----
+echo ""
+echo "[Phase 8] Certificate Expiry Check"
+echo "-----------------------------------"
+EXPIRED_CERTS=0
+EXPIRING_CERTS=0
+NOW_EPOCH=$(date +%s)
+WARN_DAYS=60
+WARN_SECS=$((WARN_DAYS * 86400))
+
+check_cert_expiry() {
+    local certfile="$1"
+    local label="$2"
+    if [ -f "$certfile" ]; then
+        local enddate
+        enddate=$(openssl x509 -in "$certfile" -noout -enddate 2>/dev/null | cut -d= -f2)
+        if [ -n "$enddate" ]; then
+            local end_epoch
+            end_epoch=$(date -d "$enddate" +%s 2>/dev/null)
+            if [ -n "$end_epoch" ]; then
+                local remaining=$((end_epoch - NOW_EPOCH))
+                local days_left=$((remaining / 86400))
+                if [ "$remaining" -lt 0 ]; then
+                    echo "  [FAIL] $label — EXPIRED ($enddate)"
+                    EXPIRED_CERTS=$((EXPIRED_CERTS + 1))
+                elif [ "$remaining" -lt "$WARN_SECS" ]; then
+                    echo "  [WARN] $label — expires in $days_left days ($enddate)"
+                    EXPIRING_CERTS=$((EXPIRING_CERTS + 1))
+                else
+                    echo "  [OK]   $label — valid until $enddate ($days_left days)"
+                fi
+            fi
+        fi
+    fi
+}
+
+# Check installed Microsoft TLS certs across distro paths
+for certdir in /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors /usr/share/pki/trust/anchors; do
+    if [ -d "$certdir" ]; then
+        for cert in "$certdir"/microsoft-*.crt; do
+            [ -f "$cert" ] && check_cert_expiry "$cert" "$(basename "$cert")"
+        done
+    fi
+done
+
+# Also check the leaf cert from IMDS
+if [ -f /tmp/imds_cert.pem ]; then
+    check_cert_expiry /tmp/imds_cert.pem "IMDS leaf cert (metadata.azure.com)"
+fi
+
+if [ "$BLOCKED" -gt 0 ] && [ "$((EXPIRED_CERTS + EXPIRING_CERTS))" -gt 0 ]; then
+    echo ""
+    echo "  [ALERT] AIA is blocked AND certificates are expiring/expired."
+    echo "          This VM cannot auto-download replacements."
+fi
+
+# ---- Phase 9: Proxy Check ----
+echo ""
+echo "[Phase 9] Proxy Configuration"
+echo "------------------------------"
+PROXY_DETECTED=false
+if [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] || [ -n "${HTTPS_PROXY:-}" ]; then
+    echo "  [INFO] Proxy detected:"
+    [ -n "${http_proxy:-}" ] && echo "         http_proxy=$http_proxy"
+    [ -n "${https_proxy:-}" ] && echo "         https_proxy=$https_proxy"
+    [ -n "${HTTP_PROXY:-}" ] && echo "         HTTP_PROXY=$HTTP_PROXY"
+    [ -n "${HTTPS_PROXY:-}" ] && echo "         HTTPS_PROXY=$HTTPS_PROXY"
+    echo "         If AIA endpoints are blocked, add them to no_proxy."
+    PROXY_DETECTED=true
+else
+    echo "  [OK]   No proxy environment variables set"
+fi
+
+# ---- Phase 10: Summary & Fix Commands ----
 echo ""
 echo "====================================================="
 echo "[Summary]"
 echo "====================================================="
 
-if [ "$CHAIN_OK" = true ] && [ "$BLOCKED" -eq 0 ]; then
+if [ "$CHAIN_OK" = true ] && [ "$BLOCKED" -eq 0 ] && [ "$CLOCK_SKEW" = false ] && [ "$EXPIRED_CERTS" -eq 0 ]; then
     echo "  ALL CHECKS PASSED"
     echo "  IMDS attestation certificate chain is healthy."
 else
@@ -282,6 +397,19 @@ if [ "$AUTOFIX" = true ] && [ "$CHAIN_OK" = false ]; then
     echo "============================================="
     echo " AutoFix: Attempting certificate remediation"
     echo "============================================="
+
+    # Fix clock skew first
+    if [ "$CLOCK_SKEW" = true ]; then
+        echo ""
+        echo "  Fixing clock skew..."
+        if command -v chronyc &>/dev/null; then
+            chronyc makestep 2>/dev/null && echo "  [OK] Clock resynced (chrony)" || echo "  [FAIL] chronyc makestep failed"
+        elif command -v ntpdate &>/dev/null; then
+            ntpdate time.windows.com 2>/dev/null && echo "  [OK] Clock resynced (ntpdate)" || echo "  [FAIL] ntpdate failed"
+        else
+            echo "  [WARN] No NTP client available to fix clock"
+        fi
+    fi
 
     # Detect distro for cert install path
     if [ -f /etc/os-release ]; then
