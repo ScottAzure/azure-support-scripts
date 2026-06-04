@@ -190,35 +190,86 @@ if ($chainBuilt -and $chainErrors.Count -eq 0) {
 # ---- Phase 4: Certificate Store Inventory ------------------------------------
 Write-Host "`n[Phase 4] Certificate Store Inventory" -ForegroundColor Cyan
 Write-Host "-------------------------------------" -ForegroundColor Cyan
-Write-Host "  Checking for IMDS-relevant certificates in local stores:`n"
+
+# Build the check list from ACTUAL chain certs (dynamic) merged with known certs.
+# IMDS rotates OCSP intermediates (02, 04, 06, 08, 10, 12, 14, 16), so we check
+# whatever the VM is actually using, not just hardcoded thumbprints.
+$certsToCheck = @()
+
+# Add certs discovered in the actual chain (skip the leaf at index 0)
+if ($chain.ChainElements.Count -gt 1) {
+    for ($ci = 1; $ci -lt $chain.ChainElements.Count; $ci++) {
+        $ec = $chain.ChainElements[$ci].Certificate
+        $cn = ($ec.Subject -replace 'CN=','').Split(',')[0].Trim()
+
+        # Determine expected store
+        $expectedStore = "CA"
+        if ($ec.Subject -eq $ec.Issuer -or $cn -match "Root G[23]?$" -and $cn -notmatch "TLS RSA Root") {
+            $expectedStore = "Root"
+        }
+        $knownMatch = $KnownCerts | Where-Object { $_.Thumbprint -eq $ec.Thumbprint }
+        if ($knownMatch) {
+            $expectedStore = $knownMatch.Store
+        }
+
+        $certsToCheck += [PSCustomObject]@{
+            CN          = $cn
+            Thumbprint  = $ec.Thumbprint
+            Type        = if ($knownMatch) { $knownMatch.Type } else { "Chain intermediate (detected)" }
+            Store       = $expectedStore
+            Location    = "LocalMachine"
+            DownloadUrl = if ($knownMatch) { $knownMatch.DownloadUrl } else { "See https://learn.microsoft.com/azure/security/fundamentals/azure-ca-details" }
+            Source      = "chain"
+        }
+    }
+}
+
+# Add any known certs not already in the list (covers certs that weren't in this chain)
+foreach ($known in $KnownCerts) {
+    if (-not ($certsToCheck | Where-Object { $_.Thumbprint -eq $known.Thumbprint })) {
+        $certsToCheck += [PSCustomObject]@{
+            CN          = $known.CN
+            Thumbprint  = $known.Thumbprint
+            Type        = $known.Type
+            Store       = $known.Store
+            Location    = $known.Location
+            DownloadUrl = $known.DownloadUrl
+            Source      = "known"
+        }
+    }
+}
+
+Write-Host "  Checking $($certsToCheck.Count) certificates (from chain + known list):`n"
 
 $missingCerts = @()
 
-foreach ($known in $KnownCerts) {
-    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($known.Store, $known.Location)
+foreach ($chk in $certsToCheck) {
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($chk.Store, $chk.Location)
     $store.Open("ReadOnly")
-    $found = $store.Certificates | Where-Object { $_.Thumbprint -eq $known.Thumbprint }
+    $found = $store.Certificates | Where-Object { $_.Thumbprint -eq $chk.Thumbprint }
     $store.Close()
 
     $wrongStores = @()
     foreach ($checkStore in @("Root","CA","My","AuthRoot")) {
-        if ($checkStore -eq $known.Store) { continue }
-        $s2 = New-Object System.Security.Cryptography.X509Certificates.X509Store($checkStore, $known.Location)
+        if ($checkStore -eq $chk.Store) { continue }
+        $s2 = New-Object System.Security.Cryptography.X509Certificates.X509Store($checkStore, $chk.Location)
         $s2.Open("ReadOnly")
-        $inWrong = $s2.Certificates | Where-Object { $_.Thumbprint -eq $known.Thumbprint }
+        $inWrong = $s2.Certificates | Where-Object { $_.Thumbprint -eq $chk.Thumbprint }
         $s2.Close()
-        if ($inWrong) { $wrongStores += "$($known.Location)\$checkStore" }
+        if ($inWrong) { $wrongStores += "$($chk.Location)\$checkStore" }
     }
 
-    $disStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Disallowed", $known.Location)
+    $disStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Disallowed", $chk.Location)
     $disStore.Open("ReadOnly")
-    $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $known.Thumbprint }
+    $inDisallowed = $disStore.Certificates | Where-Object { $_.Thumbprint -eq $chk.Thumbprint }
     $disStore.Close()
 
+    $label = if ($chk.Source -eq "chain") { "(active chain)" } else { "(known)" }
+
     if ($found) {
-        Write-Host "  [OK]   $($known.CN)" -ForegroundColor Green
-        Write-Host "         Store: $($known.Location)\$($known.Store) (correct)"
-        Write-Host "         Type : $($known.Type)"
+        Write-Host "  [OK]   $($chk.CN) $label" -ForegroundColor Green
+        Write-Host "         Store: $($chk.Location)\$($chk.Store) (correct)"
+        Write-Host "         Type : $($chk.Type)"
         if ($wrongStores.Count -gt 0) {
             Write-Host "         [WARN] Also found in: $($wrongStores -join ', ')" -ForegroundColor Yellow
         }
@@ -226,17 +277,31 @@ foreach ($known in $KnownCerts) {
             Write-Host "         [WARN] Certificate is in the DISALLOWED store!" -ForegroundColor Red
         }
     } else {
-        Write-Host "  [MISS] $($known.CN)" -ForegroundColor Red
-        Write-Host "         Expected store: $($known.Location)\$($known.Store)"
-        Write-Host "         Type          : $($known.Type)"
-        Write-Host "         Download      : $($known.DownloadUrl)" -ForegroundColor Yellow
+        $autoNote = ""
+        if ($chainBuilt -and $chk.Source -eq "chain") {
+            $autoNote = " (was auto-downloaded via AIA during chain build)"
+        }
+        Write-Host "  [MISS] $($chk.CN) $label$autoNote" -ForegroundColor $(if ($chk.Source -eq "chain") { "Yellow" } else { "Red" })
+        Write-Host "         Expected store: $($chk.Location)\$($chk.Store)"
+        Write-Host "         Type          : $($chk.Type)"
+        Write-Host "         Download      : $($chk.DownloadUrl)" -ForegroundColor Yellow
         if ($wrongStores.Count -gt 0) {
             Write-Host "         [WARN] Found in WRONG store: $($wrongStores -join ', ')" -ForegroundColor Yellow
         }
         if ($inDisallowed) {
             Write-Host "         [WARN] Certificate is in the DISALLOWED store!" -ForegroundColor Red
         }
-        $missingCerts += $known
+        $missingCerts += $chk
+    }
+}
+
+# Note about auto-download if chain passed but certs missing
+if ($chainBuilt -and $missingCerts.Count -gt 0) {
+    $autoDownloaded = $missingCerts | Where-Object { $_.Source -eq "chain" }
+    if ($autoDownloaded.Count -gt 0) {
+        Write-Host "`n  [NOTE] Chain validation PASSED but $($autoDownloaded.Count) cert(s) are not permanently" -ForegroundColor Yellow
+        Write-Host "         installed. They were auto-downloaded via AIA at runtime." -ForegroundColor Yellow
+        Write-Host "         Install them permanently to avoid failures if AIA is blocked." -ForegroundColor Yellow
     }
 }
 
