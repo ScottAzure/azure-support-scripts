@@ -90,7 +90,7 @@ echo "  $LEAF_DATES"
 echo ""
 echo "[Phase 3] Certificate Chain Validation"
 echo "--------------------------------------"
-VERIFY_RESULT=$(openssl verify /tmp/imds_cert.pem 2>&1)
+VERIFY_RESULT=$(openssl verify /tmp/imds_cert.pem 2>&1 || true)
 if echo "$VERIFY_RESULT" | grep -q ": OK"; then
     echo "  [PASS] Certificate chain validates successfully"
     CHAIN_OK=true
@@ -192,7 +192,7 @@ CLOCK_SKEW=false
 
 # Try chrony first, then ntpd, then manual date comparison
 if command -v chronyc &>/dev/null; then
-    OFFSET=$(chronyc tracking 2>/dev/null | grep "System time" | grep -oP '[0-9]+\.[0-9]+')
+    OFFSET=$(chronyc tracking 2>/dev/null | grep "System time" | sed -n 's/.*: \([0-9.]*\) seconds.*/\1/p' || true)
     if [ -n "$OFFSET" ]; then
         OFFSET_INT=$(echo "$OFFSET" | cut -d. -f1)
         if [ "${OFFSET_INT:-0}" -gt 300 ]; then
