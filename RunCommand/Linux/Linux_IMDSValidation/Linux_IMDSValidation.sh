@@ -28,6 +28,53 @@
 
 set -euo pipefail
 
+# ---- IMDS retry helper ------------------------------------------------------
+# IMDS returns HTTP 410 Gone during legitimate maintenance / cert-rotation
+# windows. Honor Retry-After if present; otherwise wait the documented
+# transient-recovery window. One retry is enough — repeated 410s mean a
+# longer outage that needs human follow-up, not more polling.
+# CALIBRATION: expert-judgment - 70s default chosen as the documented IMDS
+# transient-error recovery window; not measured against a real 410 distribution.
+IMDS_RETRY_AFTER_DEFAULT=70
+
+imds_curl_with_retry() {
+    # $1=url, $2=output-file ("-" for stdout)
+    local url="$1"
+    local outfile="${2:--}"
+    local hdrfile body code wait_secs retry_after
+    hdrfile=$(mktemp)
+
+    body=$(curl -s -D "$hdrfile" -w '\n%{http_code}' -H "Metadata:true" \
+        --connect-timeout 5 "$url" 2>/dev/null) || { rm -f "$hdrfile"; return 1; }
+    code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+
+    if [ "$code" = "410" ]; then
+        retry_after=$(grep -i '^Retry-After:' "$hdrfile" | awk -F': ' '{print $2}' | tr -d '\r')
+        wait_secs="$IMDS_RETRY_AFTER_DEFAULT"
+        if [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -gt 0 ] && [ "$retry_after" -lt 600 ]; then
+            wait_secs="$retry_after"
+        fi
+        echo "  [WARN] IMDS returned HTTP 410 Gone (transient - rotation/maintenance window)." >&2
+        echo "         Waiting ${wait_secs}s, then retrying once..." >&2
+        sleep "$wait_secs"
+        body=$(curl -s -w '\n%{http_code}' -H "Metadata:true" --connect-timeout 5 "$url" 2>/dev/null) || { rm -f "$hdrfile"; return 1; }
+        code="${body##*$'\n'}"
+        body="${body%$'\n'*}"
+    fi
+    rm -f "$hdrfile"
+
+    if [ "$code" != "200" ]; then
+        return 1
+    fi
+    if [ "$outfile" = "-" ]; then
+        printf '%s' "$body"
+    else
+        printf '%s' "$body" > "$outfile"
+    fi
+    return 0
+}
+
 echo "====================================================="
 echo " Azure IMDS Attestation Certificate Chain Validator"
 echo " Reference: https://aka.ms/AzVmIMDSValidation"
@@ -37,7 +84,7 @@ echo "====================================================="
 echo ""
 echo "[Phase 1] IMDS Endpoint Reachability"
 echo "-------------------------------------"
-if curl -s --connect-timeout 5 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" -o /dev/null; then
+if imds_curl_with_retry "http://169.254.169.254/metadata/instance?api-version=2021-02-01" /dev/null; then
     echo "  [PASS] 169.254.169.254 is reachable"
 else
     echo "  [FAIL] 169.254.169.254 is NOT reachable"
@@ -51,7 +98,10 @@ fi
 echo ""
 echo "[Phase 2] IMDS Attested Document"
 echo "--------------------------------"
-ATTESTED_JSON=$(curl -s -H "Metadata:true" "http://169.254.169.254/metadata/attested/document?api-version=2018-10-01")
+if ! ATTESTED_JSON=$(imds_curl_with_retry "http://169.254.169.254/metadata/attested/document?api-version=2018-10-01"); then
+    echo "  [FAIL] Cannot retrieve attested document"
+    exit 1
+fi
 if [ -z "$ATTESTED_JSON" ]; then
     echo "  [FAIL] Cannot retrieve attested document"
     exit 1
@@ -89,6 +139,43 @@ else
     echo "  [FAIL] Certificate chain validation failed"
     echo "  $VERIFY_RESULT"
     CHAIN_OK=false
+fi
+
+# ---- Phase 3b: Pre-expiry Window Check ----
+# openssl verify only fails AFTER a cert expires. OCSP intermediates rotate on
+# a ~1-2 year cadence; warn 60 days ahead so ops moves to the new intermediate
+# (Phase 4 detects which OCSP # is active) before silent failure.
+# CALIBRATION: expert-judgment - 60 days chosen as standard ops lead time for
+# certificate-rotation planning; not measured against IMDS rotation telemetry.
+PRE_EXPIRY_WARNING_DAYS=60
+echo ""
+echo "[Phase 3b] Pre-expiry Window Check (${PRE_EXPIRY_WARNING_DAYS} days)"
+echo "-------------------------------------"
+EXPIRY_WARNINGS=0
+NOW_EPOCH=$(date -u +%s)
+# /tmp/imds_cert.pem contains the leaf + intermediates from the PKCS#7 envelope
+csplit -z -s -b '%02d.pem' -f /tmp/imds_chain_ /tmp/imds_cert.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null || true
+for chain_pem in /tmp/imds_chain_*.pem; do
+    [ -s "$chain_pem" ] || continue
+    NOT_AFTER=$(openssl x509 -in "$chain_pem" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+    SUBJECT=$(openssl x509 -in "$chain_pem" -noout -subject 2>/dev/null | sed 's/subject= *//')
+    [ -z "$NOT_AFTER" ] && continue
+    NOT_AFTER_EPOCH=$(date -u -d "$NOT_AFTER" +%s 2>/dev/null || echo 0)
+    [ "$NOT_AFTER_EPOCH" = "0" ] && continue
+    DAYS_REMAINING=$(( (NOT_AFTER_EPOCH - NOW_EPOCH) / 86400 ))
+    if [ "$DAYS_REMAINING" -lt "$PRE_EXPIRY_WARNING_DAYS" ] && [ "$DAYS_REMAINING" -ge 0 ]; then
+        echo "  [WARN] $SUBJECT"
+        echo "         NotAfter (UTC): $NOT_AFTER"
+        echo "         Days remaining: $DAYS_REMAINING"
+        EXPIRY_WARNINGS=$((EXPIRY_WARNINGS + 1))
+    fi
+done
+rm -f /tmp/imds_chain_*.pem
+if [ "$EXPIRY_WARNINGS" -gt 0 ]; then
+    echo "  Action: confirm a successor intermediate is published and pre-install it."
+    echo "  Reference: https://learn.microsoft.com/azure/security/fundamentals/azure-ca-details"
+else
+    echo "  [OK]   No chain certificates expire within ${PRE_EXPIRY_WARNING_DAYS} days."
 fi
 
 # ---- Phase 4: OCSP Detection ----

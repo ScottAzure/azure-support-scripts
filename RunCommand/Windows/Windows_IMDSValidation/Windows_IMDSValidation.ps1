@@ -104,12 +104,46 @@ try {
     exit 1
 }
 
+# ---- IMDS retry helper -------------------------------------------------------
+# IMDS returns HTTP 410 Gone during legitimate maintenance / cert-rotation windows.
+# Honor the Retry-After header if present; otherwise wait the documented IMDS
+# recovery window. One retry is enough — repeated 410s mean a longer outage.
+# CALIBRATION: expert-judgment — 70s default chosen as the documented IMDS
+# transient-error recovery window; not measured against a real 410 distribution.
+$ImdsRetryAfterDefaultSeconds = 70
+function Invoke-ImdsRequestWithRetry {
+    param([Parameter(Mandatory)][string]$Uri)
+    try {
+        return Invoke-RestMethod -Headers @{"Metadata"="true"} -Method GET -Uri $Uri -ErrorAction Stop
+    } catch [System.Net.WebException] {
+        $resp = $_.Exception.Response
+        $code = if ($resp) { [int]$resp.StatusCode } else { 0 }
+        if ($code -ne 410) { throw }
+
+        $waitSeconds = $ImdsRetryAfterDefaultSeconds
+        try {
+            $hdr = $resp.Headers["Retry-After"]
+            if ($hdr) {
+                $parsed = 0
+                if ([int]::TryParse($hdr, [ref]$parsed) -and $parsed -gt 0 -and $parsed -lt 600) {
+                    $waitSeconds = $parsed
+                }
+            }
+        } catch { }
+
+        Write-Host "  [WARN] IMDS returned HTTP 410 Gone (transient — rotation/maintenance window)." -ForegroundColor Yellow
+        Write-Host "         Waiting $waitSeconds seconds, then retrying once..." -ForegroundColor Yellow
+        Start-Sleep -Seconds $waitSeconds
+        return Invoke-RestMethod -Headers @{"Metadata"="true"} -Method GET -Uri $Uri -ErrorAction Stop
+    }
+}
+
 # ---- Phase 2: Attestation Fetch ---------------------------------------------
 Write-Host "`n[Phase 2] IMDS Attested Document" -ForegroundColor Cyan
 Write-Host "--------------------------------" -ForegroundColor Cyan
 try {
-    $attestedDoc = Invoke-RestMethod -Headers @{"Metadata"="true"} -Method GET `
-        -Uri http://169.254.169.254/metadata/attested/document?api-version=2018-10-01
+    $attestedDoc = Invoke-ImdsRequestWithRetry `
+        -Uri "http://169.254.169.254/metadata/attested/document?api-version=2018-10-01"
     $signature = [System.Convert]::FromBase64String($attestedDoc.signature)
     $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]($signature)
 
@@ -185,6 +219,39 @@ if ($chainBuilt -and $chainErrors.Count -eq 0) {
     Write-Host "`n  [PASS] Certificate chain validated successfully." -ForegroundColor Green
 } else {
     Write-Host "`n  [FAIL] Certificate chain validation failed." -ForegroundColor Red
+}
+
+# ---- Phase 3b: Pre-expiry Window Check --------------------------------------
+# X509Chain.Build() only fails AFTER a cert expires. OCSP intermediates rotate
+# on a ~1-2 year cadence; warn 60 days ahead so customers move to the new
+# intermediate (Phase 4 detects which OCSP # is active) before silent failure.
+# CALIBRATION: expert-judgment — 60 days chosen as standard ops lead time for
+# certificate-rotation planning; not measured against IMDS rotation telemetry.
+$PreExpiryWarningDays = 60
+$expiryWarnings = @()
+$nowUtc = (Get-Date).ToUniversalTime()
+foreach ($element in $chain.ChainElements) {
+    $elCert = $element.Certificate
+    $daysRemaining = ($elCert.NotAfter.ToUniversalTime() - $nowUtc).TotalDays
+    if ($daysRemaining -lt $PreExpiryWarningDays -and $daysRemaining -ge 0) {
+        $expiryWarnings += [PSCustomObject]@{
+            Subject       = $elCert.Subject
+            Thumbprint    = $elCert.Thumbprint
+            NotAfter      = $elCert.NotAfter.ToString('yyyy-MM-dd')
+            DaysRemaining = [math]::Floor($daysRemaining)
+        }
+    }
+}
+if ($expiryWarnings.Count -gt 0) {
+    Write-Host "`n  [WARN] $($expiryWarnings.Count) chain certificate(s) expire within $PreExpiryWarningDays days:" -ForegroundColor Yellow
+    foreach ($w in $expiryWarnings) {
+        Write-Host "         - $($w.Subject)" -ForegroundColor Yellow
+        Write-Host "           Thumbprint     : $($w.Thumbprint)"
+        Write-Host "           NotAfter (UTC) : $($w.NotAfter)"
+        Write-Host "           Days remaining : $($w.DaysRemaining)"
+    }
+    Write-Host "         Action: confirm a successor intermediate is published and pre-install it." -ForegroundColor Yellow
+    Write-Host "         Reference: https://learn.microsoft.com/azure/security/fundamentals/azure-ca-details" -ForegroundColor Yellow
 }
 
 # ---- Phase 4: Certificate Store Inventory ------------------------------------
